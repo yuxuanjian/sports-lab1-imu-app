@@ -10,6 +10,9 @@ dependencies:
   flutter:
     sdk: flutter
   sensors_plus: ^7.0.0
+  path_provider: ^2.1.5
+  share_plus: ^12.0.0
+  fl_chart: ^1.1.1
 
 dev_dependencies:
   flutter_test:
