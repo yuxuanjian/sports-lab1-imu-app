@@ -2,10 +2,12 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:sensors_plus/sensors_plus.dart';
 import 'package:fl_chart/fl_chart.dart';
+import 'dart:ui' as ui;
 
 void main() => runApp(const MyApp());
 
@@ -50,6 +52,31 @@ class SensorRecorderPage extends StatefulWidget {
   State<SensorRecorderPage> createState() => _SensorRecorderPageState();
 }
 
+enum _ResPreset { hd, fhd, qhd, uhd4k, square2k, custom }
+
+_ResPreset _preset = _ResPreset.fhd; // 預設 1920x1080
+final _wCtrl = TextEditingController(text: '1920');
+final _hCtrl = TextEditingController(text: '1080');
+
+Size _currentPngSize() {
+  if (_preset == _ResPreset.custom) {
+    final w = int.tryParse(_wCtrl.text.trim()) ?? 1600;
+    final h = int.tryParse(_hCtrl.text.trim()) ?? 900;
+    // 避免太小或太大佔記憶體
+    final cw = w.clamp(320, 8192);
+    final ch = h.clamp(240, 8192);
+    return Size(cw.toDouble(), ch.toDouble());
+  }
+  switch (_preset) {
+    case _ResPreset.hd:      return const Size(1280, 720);
+    case _ResPreset.fhd:     return const Size(1920, 1080);
+    case _ResPreset.qhd:     return const Size(2560, 1440);
+    case _ResPreset.uhd4k:   return const Size(3840, 2160);
+    case _ResPreset.square2k:return const Size(2048, 2048);
+    case _ResPreset.custom:  return const Size(1600, 900);
+  }
+}
+
 class _SensorRecorderPageState extends State<SensorRecorderPage>
     with WidgetsBindingObserver {
   // ===== UI 控制 =====
@@ -57,6 +84,8 @@ class _SensorRecorderPageState extends State<SensorRecorderPage>
   final _secCtrl = TextEditingController(text: '10'); // 錄製秒數 Y s
   bool _isRecording = false;
   SensorKind _chartKind = SensorKind.accelerometer;
+  final _chartKey = GlobalKey();       // 用來抓取圖表區域
+  String? _lastPngPath;                // 最近一次存的 PNG
 
   // ===== 感測器最新值（由 stream 更新；Timer 每 tick 讀一次寫入 buffer）=====
   double _ax = 0, _ay = 0, _az = 0;
@@ -155,6 +184,212 @@ class _SensorRecorderPageState extends State<SensorRecorderPage>
     }
   }
 
+  // 圖像存檔功能
+  // 放在檔案最上方已經有：import 'dart:ui' as ui;
+  // 進行重繪
+  Future<void> _saveChartPngOffscreen() async {
+    try {
+      // 1) 準備要畫的資料（三條：x/y/z，依你選的 _chartKind）
+      List<Offset> _toSeries(List<Sample> buf, double Function(Sample) pick) =>
+          buf.map((s) => Offset(s.t, pick(s))).toList();
+
+      late final List<Offset> sx, sy, sz;
+      if (_buf.isEmpty) {
+        _snack('沒有資料可輸出');
+        return;
+      }
+      switch (_chartKind) {
+        case SensorKind.accelerometer:
+          sx = _toSeries(_buf, (s) => s.ax);
+          sy = _toSeries(_buf, (s) => s.ay);
+          sz = _toSeries(_buf, (s) => s.az);
+          break;
+        case SensorKind.gyroscope:
+          sx = _toSeries(_buf, (s) => s.gx);
+          sy = _toSeries(_buf, (s) => s.gy);
+          sz = _toSeries(_buf, (s) => s.gz);
+          break;
+        case SensorKind.magnetometer:
+          sx = _toSeries(_buf, (s) => s.mx);
+          sy = _toSeries(_buf, (s) => s.my);
+          sz = _toSeries(_buf, (s) => s.mz);
+          break;
+      }
+
+      // 2) 畫到離屏畫布（可調整輸出尺寸）
+      final ui.Image img = await _renderLinesToImage(
+        series: [sx, sy, sz],
+        colors: const [_xColor, _yColor, _zColor],
+        size: _currentPngSize(),                 // ← 用使用者選的解析度
+        bgColor: Theme.of(context).colorScheme.surface,
+        xLabel: 't (sec)',
+        yLabel: _chartKind == SensorKind.accelerometer
+            ? 'acc (m/s²)'
+            : _chartKind == SensorKind.gyroscope
+                ? 'gyro (rad/s)'
+                : 'mag (µT)',
+      );
+
+      // 3) 存檔
+      final byteData = await img.toByteData(format: ui.ImageByteFormat.png);
+      final bytes = byteData!.buffer.asUint8List();
+      final dir = await getApplicationDocumentsDirectory();
+      final fname =
+          'imu_plot_offscreen_${DateTime.now().toIso8601String().replaceAll(":", "-")}.png';
+      final file = File('${dir.path}/$fname');
+      await file.writeAsBytes(bytes);
+      setState(() => _lastPngPath = file.path);
+
+      _snack('已儲存圖檔：$fname');
+    } catch (e) {
+      _snack('存圖失敗：$e');
+    }
+  }
+
+  Future<ui.Image> _renderLinesToImage({
+    required List<List<Offset>> series,   // 每條線是 (t, value)
+    required List<Color> colors,
+    required Size size,
+    required Color bgColor,
+    String? xLabel,
+    String? yLabel,
+  }) async {
+    final recorder = ui.PictureRecorder();
+    final canvas = Canvas(recorder);
+    final paintBg = Paint()..color = bgColor;
+    canvas.drawRect(Offset.zero & size, paintBg);
+
+    // 內距：給座標軸/標籤空間
+    const double leftPad = 80, rightPad = 24, topPad = 24, bottomPad = 60;
+    final chartRect = Rect.fromLTWH(
+      leftPad, topPad, size.width - leftPad - rightPad, size.height - topPad - bottomPad,
+    );
+
+    // 計算數值範圍（x 為時間、y 依各 series）
+    double minX = double.infinity, maxX = -double.infinity;
+    double minY = double.infinity, maxY = -double.infinity;
+    for (final s in series) {
+      for (final p in s) {
+        if (p.dx < minX) minX = p.dx;
+        if (p.dx > maxX) maxX = p.dx;
+        if (p.dy < minY) minY = p.dy;
+        if (p.dy > maxY) maxY = p.dy;
+      }
+    }
+    if (minX == maxX) { minX -= 0.5; maxX += 0.5; } // 避免除以零
+    if (minY == maxY) { minY -= 0.5; maxY += 0.5; }
+
+    // 給 5% padding，看起來不會貼邊
+    final xPad = (maxX - minX) * 0.05;
+    final yPad = (maxY - minY) * 0.1;
+    minX -= xPad; maxX += xPad;
+    minY -= yPad; maxY += yPad;
+
+    double mapX(double x) => chartRect.left +
+        (x - minX) / (maxX - minX) * chartRect.width;
+    double mapY(double y) => chartRect.bottom -
+        (y - minY) / (maxY - minY) * chartRect.height;
+
+    // 畫網格與座標軸
+    final gridPaint = Paint()
+      ..color = Colors.grey.withOpacity(0.35)
+      ..strokeWidth = 1;
+    const int xTicks = 6, yTicks = 5;
+    final textPainter = TextPainter(textDirection: TextDirection.ltr);
+
+    // 垂直網格 + x tick
+    for (int i = 0; i <= xTicks; i++) {
+      final t = minX + (maxX - minX) * (i / xTicks);
+      final x = mapX(t);
+      canvas.drawLine(Offset(x, chartRect.top), Offset(x, chartRect.bottom), gridPaint);
+      final label = t.toStringAsFixed(2);
+      textPainter.text = TextSpan(style: const TextStyle(fontSize: 12, color: Colors.grey), text: label);
+      textPainter.layout();
+      textPainter.paint(
+        canvas,
+        Offset(x - textPainter.width / 2, chartRect.bottom + 6),
+      );
+    }
+
+    // 水平網格 + y tick
+    for (int i = 0; i <= yTicks; i++) {
+      final v = minY + (maxY - minY) * (i / yTicks);
+      final y = mapY(v);
+      canvas.drawLine(Offset(chartRect.left, y), Offset(chartRect.right, y), gridPaint);
+      final label = v.toStringAsFixed(2);
+      textPainter.text = const TextSpan(style: TextStyle(fontSize: 12, color: Colors.grey));
+      textPainter.text = TextSpan(style: const TextStyle(fontSize: 12, color: Colors.grey), text: label);
+      textPainter.layout();
+      textPainter.paint(
+        canvas,
+        Offset(chartRect.left - textPainter.width - 8, y - textPainter.height / 2),
+      );
+    }
+
+    // 外框
+    final borderPaint = Paint()
+      ..color = Colors.grey.withOpacity(0.8)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.2;
+    canvas.drawRect(chartRect, borderPaint);
+
+    // 畫三條線
+    for (int k = 0; k < series.length; k++) {
+      final s = series[k];
+      if (s.isEmpty) continue;
+      final path = Path();
+      for (int i = 0; i < s.length; i++) {
+        final dx = mapX(s[i].dx);
+        final dy = mapY(s[i].dy);
+        if (i == 0) {
+          path.moveTo(dx, dy);
+        } else {
+          path.lineTo(dx, dy);
+        }
+      }
+      final p = Paint()
+        ..color = colors[k]
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 2
+        ..isAntiAlias = true;
+      canvas.drawPath(path, p);
+    }
+
+    // 標籤（x/y）
+    if (xLabel != null) {
+      textPainter.text = TextSpan(style: const TextStyle(fontSize: 13, color: Colors.grey), text: xLabel);
+      textPainter.layout();
+      textPainter.paint(
+        canvas,
+        Offset(chartRect.center.dx - textPainter.width / 2, size.height - textPainter.height - 6),
+      );
+    }
+    if (yLabel != null) {
+      textPainter.text = TextSpan(style: const TextStyle(fontSize: 13, color: Colors.grey), text: yLabel);
+      textPainter.layout();
+      canvas.save();
+      canvas.translate(12, chartRect.center.dy + textPainter.width / 2);
+      canvas.rotate(-3.14159 / 2);
+      textPainter.paint(canvas, Offset.zero);
+      canvas.restore();
+    }
+
+    final picture = recorder.endRecording();
+    return picture.toImage(size.width.toInt(), size.height.toInt());
+  }
+
+  
+  // 分享圖像
+  void _shareImage() {
+    final p = _lastPngPath;
+    if (p == null) { _snack('尚未有圖檔'); return; }
+    Share.shareXFiles(
+      [XFile(p, mimeType: 'image/png', name: p.split('/').last)],
+      subject: 'IMU Plot',
+      text: 'IMU plot captured from Flutter',
+    );
+  }
+
   Future<void> _saveCsv() async {
     final dir = await getApplicationDocumentsDirectory();
     final fname =
@@ -186,6 +421,7 @@ class _SensorRecorderPageState extends State<SensorRecorderPage>
 
   // ===== 繪圖資料轉換 =====
   List<LineChartBarData> _buildSeries() {
+
     List<FlSpot> sx = [], sy = [], sz = [];
     for (final s in _buf) {
       switch (_chartKind) {
@@ -221,7 +457,7 @@ class _SensorRecorderPageState extends State<SensorRecorderPage>
         padding: const EdgeInsets.all(12),
         child: Column(
           children: [
-            // ===== 控制列：X Hz / Y 秒 + Start/Stop + Share =====
+            // ===== 控制列：X Hz / Y 秒 + Start/Stop + Share CSV + Save =====
             Wrap(
               spacing: 8,
               runSpacing: 8,
@@ -245,9 +481,57 @@ class _SensorRecorderPageState extends State<SensorRecorderPage>
                   icon: const Icon(Icons.share),
                   label: const Text('Share CSV'),
                 ),
+                // 圖像儲存與分享按鈕
+                OutlinedButton.icon(
+                  onPressed: _saveChartPngOffscreen,
+                  icon: const Icon(Icons.image_outlined),
+                  label: const Text('Save PNG'),
+                ),
+                ElevatedButton.icon(
+                  onPressed: _lastPngPath == null ? null : _shareImage,
+                  icon: const Icon(Icons.share),
+                  label: const Text('Share PNG'),
+                ),
+                // ===== 輸出圖像解析度調整功能 =====
+                Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Text('解析度:'),
+                    const SizedBox(width: 8),
+                    DropdownButton<_ResPreset>(
+                      value: _preset,
+                      items: const [
+                        DropdownMenuItem(value: _ResPreset.hd,      child: Text('1280×720')),
+                        DropdownMenuItem(value: _ResPreset.fhd,     child: Text('1920×1080')),
+                        DropdownMenuItem(value: _ResPreset.qhd,     child: Text('2560×1440')),
+                        DropdownMenuItem(value: _ResPreset.uhd4k,   child: Text('3840×2160')),
+                        DropdownMenuItem(value: _ResPreset.square2k,child: Text('2048×2048')),
+                        DropdownMenuItem(value: _ResPreset.custom,  child: Text('自訂')),
+                      ],
+                      onChanged: (v) {
+                        if (v == null) return;
+                        setState(() {
+                          _preset = v;
+                          // 切到預設時，同步輸入框文字（只為了顯示一致）
+                          if (v != _ResPreset.custom) {
+                            final s = _currentPngSize();
+                            _wCtrl.text = s.width.toInt().toString();
+                            _hCtrl.text = s.height.toInt().toString();
+                          }
+                        });
+                      },
+                    ),
+                    const SizedBox(width: 8),
+                    if (_preset == _ResPreset.custom) ...[
+                      _NumBox(controller: _wCtrl, label: 'Width'),
+                      const SizedBox(width: 8),
+                      _NumBox(controller: _hCtrl, label: 'Height'),
+                    ],
+                  ],
+                ),
               ],
             ),
-
+            
             // ===== 即時數值（以彩色點標示 x/y/z）=====
             Wrap(
               spacing: 12,
@@ -300,26 +584,33 @@ class _SensorRecorderPageState extends State<SensorRecorderPage>
             ),
 
             const SizedBox(height: 8),
-
-            // ===== 折線圖 =====
+            // ===== 折線圖 =====  
             Expanded(
-              child: Container(
-                padding: const EdgeInsets.all(8),
-                decoration: BoxDecoration(
-                  color: Theme.of(context).colorScheme.surface,
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                child: LineChart(
-                  LineChartData(
-                    minX: 0,
-                    maxX: _buf.isEmpty ? 1 : _buf.last.t,
-                    titlesData: const FlTitlesData(
-                      rightTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
-                      topTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
+              child: RepaintBoundary( // 將該ChartWidget包裝並綁到GlobalKey以供圖像存儲功能存取
+                key: _chartKey,
+                child: Padding(
+                  padding: const EdgeInsets.all(12),
+                  child: Container(
+                    padding: const EdgeInsets.all(8),
+                    decoration: BoxDecoration(
+                      color: Theme.of(context).colorScheme.surface,
+                      borderRadius: BorderRadius.circular(12),
                     ),
-                    gridData: const FlGridData(drawVerticalLine: true),
-                    borderData: FlBorderData(show: true),
-                    lineBarsData: _buildSeries(),
+                    child: LineChart(
+                      LineChartData(
+                        backgroundColor: Theme.of(context).colorScheme.surface,
+                        minX: 0,
+                        maxX: _buf.isEmpty ? 1 : _buf.last.t,
+                        clipData: FlClipData.none(),
+                        titlesData: const FlTitlesData(
+                          rightTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
+                          topTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
+                        ),
+                        gridData: const FlGridData(drawVerticalLine: true),
+                        borderData: FlBorderData(show: true),
+                        lineBarsData: _buildSeries(),
+                      ),
+                    ),
                   ),
                 ),
               ),
@@ -359,6 +650,7 @@ class _NumBox extends StatelessWidget {
   final TextEditingController controller;
   final String label;
   const _NumBox({required this.controller, required this.label});
+
   @override
   Widget build(BuildContext context) {
     return SizedBox(
@@ -381,6 +673,7 @@ class _Legend extends StatelessWidget {
   final Color color;
   final String text;
   const _Legend({required this.color, required this.text});
+  
   @override
   Widget build(BuildContext context) {
     return Row(
