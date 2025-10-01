@@ -294,7 +294,7 @@ class _SensorRecorderPageState extends State<SensorRecorderPage>
 
     // 畫網格與座標軸
     final gridPaint = Paint()
-      ..color = Colors.grey.withOpacity(0.35)
+      ..color = Colors.grey.withValues(alpha: 0.35)
       ..strokeWidth = 1;
     const int xTicks = 6, yTicks = 5;
     final textPainter = TextPainter(textDirection: TextDirection.ltr);
@@ -330,7 +330,7 @@ class _SensorRecorderPageState extends State<SensorRecorderPage>
 
     // 外框
     final borderPaint = Paint()
-      ..color = Colors.grey.withOpacity(0.8)
+      ..color = Colors.grey.withValues(alpha: 0.8)
       ..style = PaintingStyle.stroke
       ..strokeWidth = 1.2;
     canvas.drawRect(chartRect, borderPaint);
@@ -385,10 +385,14 @@ class _SensorRecorderPageState extends State<SensorRecorderPage>
   void _shareImage() {
     final p = _lastPngPath;
     if (p == null) { _snack('尚未有圖檔'); return; }
-    Share.shareXFiles(
-      [XFile(p, mimeType: 'image/png', name: p.split('/').last)],
-      subject: 'IMU Plot',
-      text: 'IMU plot captured from Flutter',
+    SharePlus.instance.share(
+      ShareParams(
+        files: [
+          XFile(p, mimeType: 'image/png', name: p.split('/').last),
+        ],
+        subject: 'IMU Plot',
+        text: 'IMU plot captured from Flutter',
+      ),
     );
   }
 
@@ -415,7 +419,12 @@ class _SensorRecorderPageState extends State<SensorRecorderPage>
   void _share() {
     final p = _lastCsvPath;
     if (p == null) { _snack('尚未有錄製檔'); return; }
-    Share.shareXFiles([XFile(p)], text: 'IMU CSV from Flutter');
+    SharePlus.instance.share(
+      ShareParams(
+        files: [XFile(p)],
+        text: 'IMU CSV from Flutter',
+      ),
+    );
   }
 
   void _snack(String msg) =>
@@ -717,7 +726,7 @@ class _HintCard extends StatelessWidget {
     final style = Theme.of(context).textTheme.bodyMedium;
     return Card(
       elevation: 0,
-      color: Theme.of(context).colorScheme.surfaceContainerHighest.withOpacity(0.5),
+  color: Theme.of(context).colorScheme.surfaceContainerHighest.withValues(alpha: 0.5),
       child: Padding(
         padding: const EdgeInsets.all(12),
         child: Column(
