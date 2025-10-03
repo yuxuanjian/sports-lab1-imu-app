@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:io';
-
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:path_provider/path_provider.dart';
@@ -22,13 +21,21 @@ class MyApp extends StatelessWidget {
   }
 }
 
-enum SensorKind { accelerometer, gyroscope, magnetometer }
+enum SensorKind {
+  accelerometer,   // 原始加速度
+  gyroscope,       // 原始角速度
+  magnetometer,    // 原始磁力
+  velocity,        // 由加速度積分 -> 速度
+  displacement,    // 由加速度兩次積分 -> 位移
+  orientation,     // 由角速度積分 -> 角度(rad)
+}
 
 // 統一三軸顏色：x=紅、y=綠、z=藍
 const _xColor = Colors.red;
 const _yColor = Colors.green;
 const _zColor = Colors.blue;
 
+/// 感測資料樣本（原始九軸）
 class Sample {
   final double t; // seconds since start
   final double ax, ay, az, gx, gy, gz, mx, my, mz;
@@ -46,12 +53,7 @@ class Sample {
   });
 }
 
-class SensorRecorderPage extends StatefulWidget {
-  const SensorRecorderPage({super.key});
-  @override
-  State<SensorRecorderPage> createState() => _SensorRecorderPageState();
-}
-
+// -------- PNG 解析度選單 --------
 enum _ResPreset { hd, fhd, qhd, uhd4k, square2k, custom }
 
 _ResPreset _preset = _ResPreset.fhd; // 預設 1920x1080
@@ -62,7 +64,6 @@ Size _currentPngSize() {
   if (_preset == _ResPreset.custom) {
     final w = int.tryParse(_wCtrl.text.trim()) ?? 1600;
     final h = int.tryParse(_hCtrl.text.trim()) ?? 900;
-    // 避免太小或太大佔記憶體
     final cw = w.clamp(320, 8192);
     final ch = h.clamp(240, 8192);
     return Size(cw.toDouble(), ch.toDouble());
@@ -77,15 +78,23 @@ Size _currentPngSize() {
   }
 }
 
+class SensorRecorderPage extends StatefulWidget {
+  const SensorRecorderPage({super.key});
+  @override
+  State<SensorRecorderPage> createState() => _SensorRecorderPageState();
+}
+
 class _SensorRecorderPageState extends State<SensorRecorderPage>
     with WidgetsBindingObserver {
   // ===== UI 控制 =====
-  final _hzCtrl = TextEditingController(text: '50'); // 取樣率 X Hz
-  final _secCtrl = TextEditingController(text: '10'); // 錄製秒數 Y s
+  final _hzCtrl = TextEditingController(text: '60'); // 取樣率 X Hz
+  final _secCtrl = TextEditingController(text: '6'); // 錄製秒數 Y s
   final ScrollController _verticalScrollCtrl = ScrollController();
   bool _isRecording = false;
+
   SensorKind _chartKind = SensorKind.accelerometer;
-  final _chartKey = GlobalKey();       // 用來抓取圖表區域
+
+  final _chartKey = GlobalKey();       // 用來抓取圖表區域（離屏畫圖不需它，但保留）
   String? _lastPngPath;                // 最近一次存的 PNG
 
   // ===== 感測器最新值（由 stream 更新；Timer 每 tick 讀一次寫入 buffer）=====
@@ -132,13 +141,12 @@ class _SensorRecorderPageState extends State<SensorRecorderPage>
     _magSub?.cancel();
     _hzCtrl.dispose();
     _secCtrl.dispose();
-  _verticalScrollCtrl.dispose();
+    _verticalScrollCtrl.dispose();
     super.dispose();
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    // 省電：背景時暫停，回前景恢復
     if (state == AppLifecycleState.paused) {
       _accSub?.pause(); _gyroSub?.pause(); _magSub?.pause();
     } else if (state == AppLifecycleState.resumed) {
@@ -186,53 +194,75 @@ class _SensorRecorderPageState extends State<SensorRecorderPage>
     }
   }
 
-  // 圖像存檔功能
-  // 放在檔案最上方已經有：import 'dart:ui' as ui;
-  // 進行重繪
+  // ======== 數值積分（raw，不扣 bias/不去重力） ========
+
+  // 一次積分：a→v 或 ω→θ（梯形法 + 起始段 t0 校正）
+  List<Offset> _integrateOnce(List<Sample> buf, double Function(Sample) pick) {
+    final result = <Offset>[];
+    if (buf.isEmpty) return result;
+
+    final t0 = buf.first.t;
+    final a0 = pick(buf.first);
+    final v0 = a0 * t0; // 用第一筆外推回 t=0 的起始段
+    double prevVal = a0;
+    double prevT = buf.first.t;
+    double integ = v0;
+
+    result.add(Offset(buf.first.t, integ));
+    for (int i = 1; i < buf.length; i++) {
+      final v = pick(buf[i]);
+      final t = buf[i].t;
+      final dt = (t - prevT);
+      // 梯形積分
+      integ += 0.5 * (v + prevVal) * dt;
+      result.add(Offset(t, integ));
+      prevVal = v;
+      prevT = t;
+    }
+    return result;
+  }
+
+  // 兩次積分：a→v→x（再做一次梯形法；含起始段近似）
+  List<Offset> _integrateTwice(List<Sample> buf, double Function(Sample) pick) {
+    if (buf.isEmpty) return <Offset>[];
+    final vel = _integrateOnce(buf, pick); // 第一次：a→v
+
+    final result = <Offset>[];
+    final t0 = buf.first.t;
+    final v0 = vel.first.dy;
+    final x0 = 0.5 * v0 * t0; // 起始段近似
+    double prevV = vel.first.dy;
+    double prevT = vel.first.dx;
+    double integ = x0;
+
+    result.add(Offset(vel.first.dx, integ));
+    for (int i = 1; i < vel.length; i++) {
+      final v = vel[i].dy;
+      final t = vel[i].dx;
+      final dt = (t - prevT);
+      integ += 0.5 * (v + prevV) * dt;
+      result.add(Offset(t, integ));
+      prevV = v;
+      prevT = t;
+    }
+    return result;
+  }
+
+  // ====== 圖像存檔（離屏） ======
   Future<void> _saveChartPngOffscreen() async {
     try {
-      // 1) 準備要畫的資料（三條：x/y/z，依你選的 _chartKind）
-      List<Offset> _toSeries(List<Sample> buf, double Function(Sample) pick) =>
-          buf.map((s) => Offset(s.t, pick(s))).toList();
+      if (_buf.isEmpty) { _snack('沒有資料可輸出'); return; }
 
-      late final List<Offset> sx, sy, sz;
-      if (_buf.isEmpty) {
-        _snack('沒有資料可輸出');
-        return;
-      }
-      switch (_chartKind) {
-        case SensorKind.accelerometer:
-          sx = _toSeries(_buf, (s) => s.ax);
-          sy = _toSeries(_buf, (s) => s.ay);
-          sz = _toSeries(_buf, (s) => s.az);
-          break;
-        case SensorKind.gyroscope:
-          sx = _toSeries(_buf, (s) => s.gx);
-          sy = _toSeries(_buf, (s) => s.gy);
-          sz = _toSeries(_buf, (s) => s.gz);
-          break;
-        case SensorKind.magnetometer:
-          sx = _toSeries(_buf, (s) => s.mx);
-          sy = _toSeries(_buf, (s) => s.my);
-          sz = _toSeries(_buf, (s) => s.mz);
-          break;
-      }
-
-      // 2) 畫到離屏畫布（可調整輸出尺寸）
+      final build = _buildOffsetSeriesForKind(_chartKind);
       final ui.Image img = await _renderLinesToImage(
-        series: [sx, sy, sz],
+        series: [build.$1, build.$2, build.$3],
         colors: const [_xColor, _yColor, _zColor],
-        size: _currentPngSize(),                 // ← 用使用者選的解析度
+        size: _currentPngSize(),
         bgColor: Theme.of(context).colorScheme.surface,
         xLabel: 't (sec)',
-        yLabel: _chartKind == SensorKind.accelerometer
-            ? 'acc (m/s²)'
-            : _chartKind == SensorKind.gyroscope
-                ? 'gyro (rad/s)'
-                : 'mag (µT)',
+        yLabel: build.$4,
       );
 
-      // 3) 存檔
       final byteData = await img.toByteData(format: ui.ImageByteFormat.png);
       final bytes = byteData!.buffer.asUint8List();
       final dir = await getApplicationDocumentsDirectory();
@@ -261,13 +291,11 @@ class _SensorRecorderPageState extends State<SensorRecorderPage>
     final paintBg = Paint()..color = bgColor;
     canvas.drawRect(Offset.zero & size, paintBg);
 
-    // 內距：給座標軸/標籤空間
     const double leftPad = 80, rightPad = 24, topPad = 24, bottomPad = 60;
     final chartRect = Rect.fromLTWH(
       leftPad, topPad, size.width - leftPad - rightPad, size.height - topPad - bottomPad,
     );
 
-    // 計算數值範圍（x 為時間、y 依各 series）
     double minX = double.infinity, maxX = -double.infinity;
     double minY = double.infinity, maxY = -double.infinity;
     for (final s in series) {
@@ -278,10 +306,9 @@ class _SensorRecorderPageState extends State<SensorRecorderPage>
         if (p.dy > maxY) maxY = p.dy;
       }
     }
-    if (minX == maxX) { minX -= 0.5; maxX += 0.5; } // 避免除以零
+    if (minX == maxX) { minX -= 0.5; maxX += 0.5; }
     if (minY == maxY) { minY -= 0.5; maxY += 0.5; }
 
-    // 給 5% padding，看起來不會貼邊
     final xPad = (maxX - minX) * 0.05;
     final yPad = (maxY - minY) * 0.1;
     minX -= xPad; maxX += xPad;
@@ -292,14 +319,12 @@ class _SensorRecorderPageState extends State<SensorRecorderPage>
     double mapY(double y) => chartRect.bottom -
         (y - minY) / (maxY - minY) * chartRect.height;
 
-    // 畫網格與座標軸
     final gridPaint = Paint()
       ..color = Colors.grey.withValues(alpha: 0.35)
       ..strokeWidth = 1;
     const int xTicks = 6, yTicks = 5;
     final textPainter = TextPainter(textDirection: TextDirection.ltr);
 
-    // 垂直網格 + x tick
     for (int i = 0; i <= xTicks; i++) {
       final t = minX + (maxX - minX) * (i / xTicks);
       final x = mapX(t);
@@ -313,13 +338,11 @@ class _SensorRecorderPageState extends State<SensorRecorderPage>
       );
     }
 
-    // 水平網格 + y tick
     for (int i = 0; i <= yTicks; i++) {
       final v = minY + (maxY - minY) * (i / yTicks);
       final y = mapY(v);
       canvas.drawLine(Offset(chartRect.left, y), Offset(chartRect.right, y), gridPaint);
       final label = v.toStringAsFixed(2);
-      textPainter.text = const TextSpan(style: TextStyle(fontSize: 12, color: Colors.grey));
       textPainter.text = TextSpan(style: const TextStyle(fontSize: 12, color: Colors.grey), text: label);
       textPainter.layout();
       textPainter.paint(
@@ -328,14 +351,12 @@ class _SensorRecorderPageState extends State<SensorRecorderPage>
       );
     }
 
-    // 外框
     final borderPaint = Paint()
       ..color = Colors.grey.withValues(alpha: 0.8)
       ..style = PaintingStyle.stroke
       ..strokeWidth = 1.2;
     canvas.drawRect(chartRect, borderPaint);
 
-    // 畫三條線
     for (int k = 0; k < series.length; k++) {
       final s = series[k];
       if (s.isEmpty) continue;
@@ -343,11 +364,8 @@ class _SensorRecorderPageState extends State<SensorRecorderPage>
       for (int i = 0; i < s.length; i++) {
         final dx = mapX(s[i].dx);
         final dy = mapY(s[i].dy);
-        if (i == 0) {
-          path.moveTo(dx, dy);
-        } else {
-          path.lineTo(dx, dy);
-        }
+        if (i == 0) path.moveTo(dx, dy);
+        else path.lineTo(dx, dy);
       }
       final p = Paint()
         ..color = colors[k]
@@ -357,7 +375,6 @@ class _SensorRecorderPageState extends State<SensorRecorderPage>
       canvas.drawPath(path, p);
     }
 
-    // 標籤（x/y）
     if (xLabel != null) {
       textPainter.text = TextSpan(style: const TextStyle(fontSize: 13, color: Colors.grey), text: xLabel);
       textPainter.layout();
@@ -380,7 +397,6 @@ class _SensorRecorderPageState extends State<SensorRecorderPage>
     return picture.toImage(size.width.toInt(), size.height.toInt());
   }
 
-  
   // 分享圖像
   void _shareImage() {
     final p = _lastPngPath;
@@ -396,21 +412,138 @@ class _SensorRecorderPageState extends State<SensorRecorderPage>
     );
   }
 
+  // ======== 圖表資料建構 ========
+  // 取得 Offset series（給離屏與 on-screen 共用）
+  // 回傳：(sx, sy, sz, yLabel)
+  (List<Offset>, List<Offset>, List<Offset>, String) _buildOffsetSeriesForKind(
+      SensorKind kind) {
+    List<Offset> sx = [], sy = [], sz = [];
+    String yLabel = '';
+
+    switch (kind) {
+      case SensorKind.accelerometer:
+        for (final s in _buf) {
+          sx.add(Offset(s.t, s.ax));
+          sy.add(Offset(s.t, s.ay));
+          sz.add(Offset(s.t, s.az));
+        }
+        yLabel = 'acc (m/s²)';
+        break;
+
+      case SensorKind.gyroscope:
+        for (final s in _buf) {
+          sx.add(Offset(s.t, s.gx));
+          sy.add(Offset(s.t, s.gy));
+          sz.add(Offset(s.t, s.gz));
+        }
+        yLabel = 'gyro (rad/s)';
+        break;
+
+      case SensorKind.magnetometer:
+        for (final s in _buf) {
+          sx.add(Offset(s.t, s.mx));
+          sy.add(Offset(s.t, s.my));
+          sz.add(Offset(s.t, s.mz));
+        }
+        yLabel = 'mag (µT)';
+        break;
+
+      case SensorKind.velocity: {
+        // acc → vel（raw，不扣 bias）
+        sx = _integrateOnce(_buf, (s) => s.ax);
+        sy = _integrateOnce(_buf, (s) => s.ay);
+        sz = _integrateOnce(_buf, (s) => s.az);
+        yLabel = 'velocity (m/s)';
+      } break;
+
+      case SensorKind.displacement: {
+        // acc → vel → pos（raw，不扣 bias）
+        sx = _integrateTwice(_buf, (s) => s.ax);
+        sy = _integrateTwice(_buf, (s) => s.ay);
+        sz = _integrateTwice(_buf, (s) => s.az);
+        yLabel = 'displacement (m)';
+      } break;
+
+      case SensorKind.orientation: {
+        // gyro → angle (rad)（raw，不扣 bias）
+        sx = _integrateOnce(_buf, (s) => s.gx);
+        sy = _integrateOnce(_buf, (s) => s.gy);
+        sz = _integrateOnce(_buf, (s) => s.gz);
+        yLabel = 'angle (rad)';
+      } break;
+    }
+    return (sx, sy, sz, yLabel);
+  }
+
+  // 把三條 Offset series 轉成 fl_chart 的資料
+  List<LineChartBarData> _barsFromOffsets(
+    List<Offset> sx, List<Offset> sy, List<Offset> sz,
+  ) {
+    LineChartBarData _l(List<Offset> pts, Color c) => LineChartBarData(
+          spots: pts.map((p) => FlSpot(p.dx, p.dy)).toList(),
+          isCurved: false,
+          dotData: const FlDotData(show: false),
+          barWidth: 2,
+          color: c,
+        );
+    return [_l(sx, _xColor), _l(sy, _yColor), _l(sz, _zColor)];
+  }
+
+  // ======== 匯出 CSV（含 v-t、x-t、rad） ========
   Future<void> _saveCsv() async {
+    if (_buf.isEmpty) {
+      _snack('沒有資料可儲存');
+      return;
+    }
+
+    // 先把三組積分算好（全部 raw，不扣 bias）
+    final vX = _integrateOnce(_buf, (s) => s.ax); // m/s
+    final vY = _integrateOnce(_buf, (s) => s.ay);
+    final vZ = _integrateOnce(_buf, (s) => s.az);
+
+    final pX = _integrateTwice(_buf, (s) => s.ax); // m
+    final pY = _integrateTwice(_buf, (s) => s.ay);
+    final pZ = _integrateTwice(_buf, (s) => s.az);
+
+    final rX = _integrateOnce(_buf, (s) => s.gx); // rad
+    final rY = _integrateOnce(_buf, (s) => s.gy);
+    final rZ = _integrateOnce(_buf, (s) => s.gz);
+
     final dir = await getApplicationDocumentsDirectory();
-    final fname =
-        'imu_${DateTime.now().toIso8601String().replaceAll(":", "-")}.csv';
+    final fname = 'imu_${DateTime.now().toIso8601String().replaceAll(":", "-")}.csv';
     final file = File('${dir.path}/$fname');
 
     final sb = StringBuffer();
-    sb.writeln('t_sec,acc_x,acc_y,acc_z,gyro_x,gyro_y,gyro_z,mag_x,mag_y,mag_z');
-    for (final s in _buf) {
-      sb.writeln(
-          '${s.t.toStringAsFixed(3)},'
-          '${s.ax.toStringAsFixed(6)},${s.ay.toStringAsFixed(6)},${s.az.toStringAsFixed(6)},'
-          '${s.gx.toStringAsFixed(6)},${s.gy.toStringAsFixed(6)},${s.gz.toStringAsFixed(6)},'
-          '${s.mx.toStringAsFixed(6)},${s.my.toStringAsFixed(6)},${s.mz.toStringAsFixed(6)}');
+    // 標頭：時間 + 原始九軸 + 速度三軸 + 位移三軸 + 角度三軸
+    sb.writeln([
+      't_sec',
+      'acc_x','acc_y','acc_z',
+      'gyro_x','gyro_y','gyro_z',
+      'mag_x','mag_y','mag_z',
+      'vel_x','vel_y','vel_z',      // v-t
+      'disp_x','disp_y','disp_z',   // x-t
+      'rad_x','rad_y','rad_z',      // angle(rad)
+    ].join(','));
+
+    final n = _buf.length;
+    for (int i = 0; i < n; i++) {
+      final s = _buf[i];
+
+      final vx = vX[i].dy, vy = vY[i].dy, vz = vZ[i].dy;
+      final px = pX[i].dy, py = pY[i].dy, pz = pZ[i].dy;
+      final rx = rX[i].dy, ry = rY[i].dy, rz = rZ[i].dy;
+
+      sb.writeln([
+        s.t.toStringAsFixed(3),
+        s.ax.toStringAsFixed(6), s.ay.toStringAsFixed(6), s.az.toStringAsFixed(6),
+        s.gx.toStringAsFixed(6), s.gy.toStringAsFixed(6), s.gz.toStringAsFixed(6),
+        s.mx.toStringAsFixed(6), s.my.toStringAsFixed(6), s.mz.toStringAsFixed(6),
+        vx.toStringAsFixed(6), vy.toStringAsFixed(6), vz.toStringAsFixed(6),
+        px.toStringAsFixed(6), py.toStringAsFixed(6), pz.toStringAsFixed(6),
+        rx.toStringAsFixed(6), ry.toStringAsFixed(6), rz.toStringAsFixed(6),
+      ].join(','));
     }
+
     await file.writeAsString(sb.toString());
     setState(() { _lastCsvPath = file.path; });
     _snack('CSV 已儲存：$fname');
@@ -430,30 +563,6 @@ class _SensorRecorderPageState extends State<SensorRecorderPage>
   void _snack(String msg) =>
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
 
-  // ===== 繪圖資料轉換 =====
-  List<LineChartBarData> _buildSeries() {
-
-    List<FlSpot> sx = [], sy = [], sz = [];
-    for (final s in _buf) {
-      switch (_chartKind) {
-        case SensorKind.accelerometer:
-          sx.add(FlSpot(s.t, s.ax)); sy.add(FlSpot(s.t, s.ay)); sz.add(FlSpot(s.t, s.az)); break;
-        case SensorKind.gyroscope:
-          sx.add(FlSpot(s.t, s.gx)); sy.add(FlSpot(s.t, s.gy)); sz.add(FlSpot(s.t, s.gz)); break;
-        case SensorKind.magnetometer:
-          sx.add(FlSpot(s.t, s.mx)); sy.add(FlSpot(s.t, s.my)); sz.add(FlSpot(s.t, s.mz)); break;
-      }
-    }
-    LineChartBarData _l(List<FlSpot> pts, Color c) => LineChartBarData(
-      spots: pts,
-      isCurved: false,
-      dotData: const FlDotData(show: false),
-      barWidth: 2,
-      color: c,
-    );
-    return [_l(sx, _xColor), _l(sy, _yColor), _l(sz, _zColor)];
-  }
-
   @override
   Widget build(BuildContext context) {
     final latest = [
@@ -462,7 +571,8 @@ class _SensorRecorderPageState extends State<SensorRecorderPage>
       ('MAG (µT)', _mx, _my, _mz),
     ];
 
-    // ------------------- Scaffold.body -------------------
+    final built = _buildOffsetSeriesForKind(_chartKind); // for chart & labels
+
     return Scaffold(
       appBar: AppBar(title: const Text('IMU Recorder')),
       body: LayoutBuilder(
@@ -546,47 +656,40 @@ class _SensorRecorderPageState extends State<SensorRecorderPage>
                     const SizedBox(height: 8),
 
                     // ===== 3. 圖表選擇器 + 圖例 =====
-                    SingleChildScrollView(
-                      scrollDirection: Axis.horizontal,
-                      child: ConstrainedBox(
-                        constraints: BoxConstraints(
-                          minWidth: viewportWidth,
-                          maxWidth: viewportWidth,
-                        ),
-                        child: Row(
-                          children: [
-                            const Text('Plot:'),
-                            const SizedBox(width: 8),
-                            DropdownButton<SensorKind>(
-                              value: _chartKind,
-                              items: const [
-                                DropdownMenuItem(value: SensorKind.accelerometer, child: Text('Accelerometer')),
-                                DropdownMenuItem(value: SensorKind.gyroscope, child: Text('Gyroscope')),
-                                DropdownMenuItem(value: SensorKind.magnetometer, child: Text('Magnetometer')),
-                              ],
-                              onChanged: (v) => setState(() => _chartKind = v!),
-                            ),
-                            const SizedBox(width: 16),
-                            Row(children: const [
-                              _Legend(color: _xColor, text: 'x'),
-                              SizedBox(width: 8),
-                              _Legend(color: _yColor, text: 'y'),
-                              SizedBox(width: 8),
-                              _Legend(color: _zColor, text: 'z'),
-                            ]),
-                            const SizedBox(width: 16),
-                            Text('樣本數：${_buf.length}'),
-                          ],
-                        ),
+                    Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 4),
+                      child: Wrap(
+                        spacing: 12,
+                        runSpacing: 8,
+                        crossAxisAlignment: WrapCrossAlignment.center,
+                        children: [
+                          const Text('t:'),
+                          DropdownButton<SensorKind>(
+                            value: _chartKind,
+                            items: const [
+                              DropdownMenuItem(value: SensorKind.accelerometer, child: Text('Accelerometer (a)')),
+                              DropdownMenuItem(value: SensorKind.velocity, child: Text('Velocity (m/s)(∫a dt)')),
+                              DropdownMenuItem(value: SensorKind.displacement, child: Text('Displacement(m)(∫∫a dt²)')),
+                              DropdownMenuItem(value: SensorKind.gyroscope, child: Text('Gyroscope (ω)')),
+                              DropdownMenuItem(value: SensorKind.orientation, child: Text('Angle (rad)(∫ω dt)')),
+                              DropdownMenuItem(value: SensorKind.magnetometer, child: Text('Magnetometer (B)')),
+                            ],
+                            onChanged: (v) => setState(() => _chartKind = v!),
+                          ),
+                          const _Legend(color: _xColor, text: 'x'),
+                          const _Legend(color: _yColor, text: 'y'),
+                          const _Legend(color: _zColor, text: 'z'),
+                          Text('樣本數：${_buf.length}'),
+                        ],
                       ),
                     ),
 
                     const SizedBox(height: 8),
 
-                    // ===== 4. 折線圖 =====
+                    // ===== 4. 折線圖（y 軸動態單位） =====
                     SizedBox(
                       width: viewportWidth,
-                      height: 300,
+                      height: 350,
                       child: RepaintBoundary(
                         key: _chartKey,
                         child: Padding(
@@ -602,13 +705,34 @@ class _SensorRecorderPageState extends State<SensorRecorderPage>
                                 backgroundColor: Theme.of(context).colorScheme.surface,
                                 minX: 0,
                                 maxX: _buf.isEmpty ? 1 : _buf.last.t,
-                                titlesData: const FlTitlesData(
-                                  rightTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
-                                  topTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
+                                titlesData: FlTitlesData(
+                                  rightTitles: const AxisTitles(
+                                    sideTitles: SideTitles(showTitles: false),
+                                  ),
+                                  topTitles: const AxisTitles(
+                                    sideTitles: SideTitles(showTitles: false),
+                                  ),
+                                  bottomTitles: const AxisTitles(
+                                    axisNameWidget: const Text('t (sec)'),
+                                    axisNameSize: 22,           // ← 軸名區加大
+                                    sideTitles: SideTitles(
+                                      showTitles: true,
+                                      reservedSize: 44, 
+                                    ),
+                                  ),
+                                  leftTitles: AxisTitles(
+                                    axisNameWidget: Text(built.$4), // 動態單位
+                                    axisNameSize: 20,
+                                    sideTitles: const SideTitles(
+                                      showTitles: true,
+                                      reservedSize: 44,
+                                    ),
+                                  ),
                                 ),
                                 gridData: const FlGridData(drawVerticalLine: true),
                                 borderData: FlBorderData(show: true),
-                                lineBarsData: _buildSeries(),
+                                lineBarsData:
+                                    _barsFromOffsets(built.$1, built.$2, built.$3),
                               ),
                             ),
                           ),
@@ -618,37 +742,32 @@ class _SensorRecorderPageState extends State<SensorRecorderPage>
 
                     if (_lastCsvPath != null) ...[
                       const SizedBox(height: 6),
-                      SingleChildScrollView(
-                        scrollDirection: Axis.horizontal,
-                        child: ConstrainedBox(
-                          constraints: BoxConstraints(
-                            minWidth: viewportWidth,
-                            maxWidth: viewportWidth,
-                          ),
-                          child: Row(
-                            children: [
-                              Expanded(
-                                child: Text(
-                                  '已儲存：$_lastCsvPath',
-                                  style: Theme.of(context).textTheme.bodySmall,
-                                ),
+                      // 讓路徑在可視範圍內橫向捲動，避免 RenderFlex overflow
+                      Row(
+                        children: [
+                          Expanded(
+                            child: SingleChildScrollView(
+                              scrollDirection: Axis.horizontal,
+                              child: Text(
+                                '已儲存：$_lastCsvPath',
+                                style: Theme.of(context).textTheme.bodySmall,
                               ),
-                              const SizedBox(width: 8),
-                              OutlinedButton.icon(
-                                onPressed: _share,
-                                icon: const Icon(Icons.share),
-                                label: const Text('Share'),
-                              ),
-                            ],
+                            ),
                           ),
-                        ),
+                          const SizedBox(width: 8),
+                          OutlinedButton.icon(
+                            onPressed: _share,
+                            icon: const Icon(Icons.share),
+                            label: const Text('Share'),
+                          ),
+                        ],
                       ),
                     ],
 
                     const SizedBox(height: 8),
 
                     // ===== 5. 動作提示卡 =====
-                    _HintCard(),
+                    const _HintCard(),
                   ],
                 ),
               ),
@@ -660,7 +779,7 @@ class _SensorRecorderPageState extends State<SensorRecorderPage>
   }
 }
 
-// 簡易數字輸入框
+// ========= 小元件 =========
 class _NumBox extends StatelessWidget {
   final TextEditingController controller;
   final String label;
@@ -683,12 +802,10 @@ class _NumBox extends StatelessWidget {
   }
 }
 
-// 彩色圖例點
 class _Legend extends StatelessWidget {
   final Color color;
   final String text;
   const _Legend({required this.color, required this.text});
-  
   @override
   Widget build(BuildContext context) {
     return Row(
@@ -718,7 +835,6 @@ class _LegendDot extends StatelessWidget {
   }
 }
 
-// 動作提示卡（方形路徑／翻轉）
 class _HintCard extends StatelessWidget {
   const _HintCard();
   @override
@@ -726,7 +842,7 @@ class _HintCard extends StatelessWidget {
     final style = Theme.of(context).textTheme.bodyMedium;
     return Card(
       elevation: 0,
-  color: Theme.of(context).colorScheme.surfaceContainerHighest.withValues(alpha: 0.5),
+      color: Theme.of(context).colorScheme.surfaceContainerHighest.withValues(alpha: 0.5),
       child: Padding(
         padding: const EdgeInsets.all(12),
         child: Column(
@@ -740,14 +856,12 @@ class _HintCard extends StatelessWidget {
             const SizedBox(height: 6),
             Text('① 方形路徑（順時針）', style: style?.copyWith(fontWeight: FontWeight.w600)),
             const SizedBox(height: 2),
-            Text('‧ 模擬器：More(…)> Virtual sensors > Move，拖曳 X/Y 滑桿畫出順時針方形路徑。',
-                style: style),
+            Text('‧ 模擬器：More(…)> Virtual sensors > Move，拖曳 X/Y 滑桿畫出順時針方形路徑。', style: style),
             Text('‧ 實機：手機平放於桌面，沿桌面畫一個順時針方形移動。', style: style),
             const SizedBox(height: 8),
             Text('② 沿 Y 軸逆時針翻轉', style: style?.copyWith(fontWeight: FontWeight.w600)),
             const SizedBox(height: 2),
-            Text('‧ 模擬器：More(…)> Virtual sensors > Device Pose/Rotate，調整對應 Y 軸的旋轉控制，做逆時針翻轉。',
-                style: style),
+            Text('‧ 模擬器：More(…)> Device Pose/Rotate，調整對應 Y 軸的旋轉控制，做逆時針翻轉。', style: style),
             Text('‧ 實機：手持手機，沿左右邊緣連線的軸做逆時針旋轉。', style: style),
           ],
         ),
